@@ -602,8 +602,8 @@ Analyzes an open fmri dataset
 """
 
 def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
-                             task_id=None, output_dir=None, subj_prefix='*',
-                             hpcutoff=120., use_derivatives=True,
+                             task_id=None, output_dir=None, exclude_dir=None,
+                             subj_prefix='*', hpcutoff=120., use_derivatives=True,
                              fwhm=6.0, subjects_dir=None, target=None):
     """Analyzes an open fmri dataset
 
@@ -622,8 +622,8 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
     """
 
     preproc = create_featreg_preproc(whichvol='first')
-    modelfit = create_modelfit_workflow()
-    fixed_fx = create_fixed_effects_flow()
+    #modelfit = create_modelfit_workflow()
+    #fixed_fx = create_fixed_effects_flow()   # inserting workflows below, with changes
     if subjects_dir:
         registration = create_fs_reg_workflow()
     else:
@@ -737,7 +737,7 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
     Setup a basic set of contrasts, a t-test per condition
     """
 
-    def get_contrasts(contrast_file, task_id, conds):
+    def get_contrasts(contrast_file, task_id, conds, behav):
         import numpy as np
         import os
         contrast_def = []
@@ -748,6 +748,23 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
         for row in contrast_def:
             if row[0] != 'task%03d' % task_id:
                 continue
+        
+            ## change the contrast vector if there are missing conditions (per run)
+            #contrast_vec = row[2:].astype(float).tolist()
+            #contrast_vec_orig = contrast_vec
+            #on_off = [[0, 1], [2, 3]]
+            #for indices in on_off:
+            #    for i in indices:
+            #        with open(behav[i], 'r') as f:
+            #            if f.read() == '0\t0\t0':   # empty onset file
+            #                for j in indices:
+            #                    contrast_vec[j] *= 2   
+            #                contrast_vec[i] = 0 
+            #if len(set(contrast_vec)) == 1:
+            #    contrast_vec = contrast_vec_orig
+            #con = [row[1], 'T', ['cond%03d' % (i + 1)  for i in range(len(conds))],
+            #       contrast_vec]
+
             con = [row[1], 'T', ['cond%03d' % (i + 1)  for i in range(len(conds))],
                    row[2:].astype(float).tolist()]
             contrasts.append(con)
@@ -756,12 +773,14 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
             con = [cond, 'T', ['cond%03d' % (i + 1)], [1]]
             contrasts.append(con)
         return contrasts
-
-    contrastgen = pe.Node(niu.Function(input_names=['contrast_file',
-                                                    'task_id', 'conds'],
+    
+    contrastgen = pe.MapNode(niu.Function(input_names=['contrast_file',   # changed to MapNode
+                                                    'task_id', 'conds', 'behav'],
                                        output_names=['contrasts'],
                                        function=get_contrasts),
+                          iterfield=['behav'],
                           name='contrastgen')
+
 
     art = pe.MapNode(interface=ra.ArtifactDetect(use_differences=[True, False],
                                                  use_norm=True,
@@ -773,7 +792,9 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
                                 'mask_file'],
                      name="art")
 
-    modelspec = pe.Node(interface=model.SpecifyModel(),
+    modelspec = pe.MapNode(interface=model.SpecifyModel(),   # changed to MapNode 
+                           iterfield=['event_files', 'functional_runs',
+                                      'outlier_files', 'realignment_parameters'],
                            name="modelspec")
     modelspec.inputs.input_units = 'secs'
 
@@ -785,7 +806,8 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
             behav = [behav]
         behav_array = np.array(behav).flatten()
         num_elements = behav_array.shape[0]
-        return behav_array.reshape(num_elements/num_conds, num_conds).tolist()
+        reshaped = behav_array.reshape(num_elements/num_conds, num_conds).tolist()
+        return [[behav] for behav in reshaped]
 
     reshape_behav = pe.Node(niu.Function(input_names=['behav', 'run_id', 'conds'],
                                        output_names=['behav'],
@@ -798,6 +820,79 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
     wf.connect(subjinfo, 'conds', reshape_behav, 'conds')
     wf.connect(reshape_behav, 'behav', modelspec, 'event_files')
 
+    modelfit = pe.Workflow(name='modelfit')
+
+    inputspec = pe.Node(niu.IdentityInterface(fields=['session_info',
+                                                       'interscan_interval',
+                                                       'contrasts',
+                                                       'film_threshold',
+                                                       'functional_data',
+                                                       'bases',
+                                                       'model_serial_correlations']),
+                        name='inputspec')
+    
+    level1design = pe.MapNode(interface=fsl.Level1Design(),   # changed to MapNode
+                              iterfield=['session_info', 'contrasts'],
+                              name="level1design")
+
+    modelgen = pe.MapNode(interface=fsl.FEATModel(), name='modelgen',
+                          iterfield=['fsf_file', 'ev_files'])
+    
+    modelestimate = pe.MapNode(interface=fsl.FILMGLS(smooth_autocorr=True,
+                                                     mask_size=5),
+                               name='modelestimate',
+                               iterfield=['design_file', 'in_file', 
+                                            'tcon_file'])
+
+    merge_contrasts = pe.MapNode(interface=niu.Merge(2), name='merge_contrasts',
+                                 iterfield = ['in1'])
+    ztopval = pe.MapNode(interface=fsl.ImageMaths(op_string='-ztop',
+                                                  suffix='_pval'),
+                         nested=True,
+                         name='ztop',
+                         iterfield=['in_file'])
+    outputspec = pe.Node(niu.IdentityInterface(fields=['copes', 'varcopes',
+                                                        'dof_file', 'pfiles',
+                                                        'zfiles',
+                                                        'parameter_estimates']),
+                         name='outputspec')
+
+    """
+    Setup the connections
+    """
+
+    modelfit.connect([
+        (inputspec, level1design, [('interscan_interval', 'interscan_interval'),
+                                   ('session_info', 'session_info'),
+                                   ('contrasts', 'contrasts'),
+                                   ('bases', 'bases'),
+                                   ('model_serial_correlations',
+                                    'model_serial_correlations')]),
+        (inputspec, modelestimate, [('film_threshold', 'threshold'),
+                                    ('functional_data', 'in_file')]),
+        (level1design, modelgen, [('fsf_files', 'fsf_file'),
+                                  ('ev_files', 'ev_files')]),
+        (modelgen, modelestimate, [('design_file', 'design_file')]),
+
+        (merge_contrasts, ztopval, [('out', 'in_file')]),
+        (ztopval, outputspec, [('out_file', 'pfiles')]),
+        (merge_contrasts, outputspec, [('out', 'zfiles')]),
+        (modelestimate, outputspec, [('param_estimates', 'parameter_estimates'),
+                                     ('dof_file', 'dof_file')]),
+    ])
+    
+    modelfit.connect([
+        (modelgen, modelestimate, [('con_file', 'tcon_file'),
+                                   ('fcon_file', 'fcon_file')]),
+        (modelestimate, merge_contrasts, [('zstats', 'in1'),
+                                          ('zfstats', 'in2')]),
+        (modelestimate, outputspec, [('copes', 'copes'),
+                                     ('varcopes', 'varcopes')]),
+        ])
+
+
+    #####
+
     wf.connect(subjinfo, 'TR', modelfit, 'inputspec.interscan_interval')
     wf.connect(subjinfo, 'conds', contrastgen, 'conds')
     if has_contrast:
@@ -805,6 +900,7 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
     else:
         contrastgen.inputs.contrast_file = ''
     wf.connect(infosource, 'task_id', contrastgen, 'task_id')
+    wf.connect(datasource, 'behav', contrastgen, 'behav')
     wf.connect(contrastgen, 'contrasts', modelfit, 'inputspec.contrasts')
 
     wf.connect([(preproc, art, [('outputspec.motion_parameters',
@@ -839,29 +935,158 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
     Reorder the copes so that now it combines across runs
     """
 
-    def sort_copes(copes, varcopes, contrasts):
+    def sort_copes(copes, varcopes, contrasts, subject_id, model_id, exclude_dir):
+        import os
         import numpy as np
         if not isinstance(copes, list):
             copes = [copes]
             varcopes = [varcopes]
-        num_copes = len(contrasts)
-        n_runs = len(copes)
+        num_copes = len(contrasts[0])   ### TEMP FIX
+        #n_runs = len(copes)
         all_copes = np.array(copes).flatten()
         all_varcopes = np.array(varcopes).flatten()
-        outcopes = all_copes.reshape(len(all_copes)/num_copes, num_copes).T.tolist()
-        outvarcopes = all_varcopes.reshape(len(all_varcopes)/num_copes, num_copes).T.tolist()
-        return outcopes, outvarcopes, n_runs
+        outcopes = all_copes.reshape(len(all_copes)/num_copes, num_copes).T#.tolist()
+        outvarcopes = all_varcopes.reshape(len(all_varcopes)/num_copes, num_copes).T#.tolist()
+
+        ## filters only the usable copes into fixedfx
+        mask = np.genfromtxt(os.path.join(exclude_dir, 'exclude_copes_%s.txt' 
+                              % subject_id), skip_header=1, delimiter=',')
+        mask = np.delete(mask,0,1)
+        all_zeros = (mask == 0.0).all(axis=1)
+        all_zeros_index = np.where((all_zeros == True))[0].tolist()
+        mask[all_zeros,:] = 1.0
+        idx_lists = [[i for i, num in enumerate(row) if num == 1.0] for row in mask]
+        # idx_lists contains the indices of the usable copes (will use to get correct dof)
+        outcopes = [[outcopes[cope_num][idx] for idx in idx_list] 
+                        for cope_num, idx_list in enumerate(idx_lists)]
+        outvarcopes = [[outvarcopes[varcope_num][idx] for idx in idx_list] 
+                        for varcope_num, idx_list in enumerate(idx_lists)]
+        copes_exclude = list(sorted(set([cope.split('/')[-1] for cope_num in all_zeros_index 
+                            for cope in outcopes[cope_num]])))
+        n_runs = [len(copes) for copes in outcopes]  
+        return outcopes, outvarcopes, n_runs, copes_exclude, idx_lists, num_copes
+
+    def copes_to_exclude(copes_exclude):   # writes file that contains copes to exclude from group 
+        import os                          # analysis (subject was missing a condition across all runs)
+        copes_exclude_file = os.path.join(os.getcwd(), 'copes_exclude.txt')
+        with open(copes_exclude_file, 'w') as wf:
+            wf.write('\n'.join(copes_exclude))
+        return copes_exclude_file
+
+    copes_to_exclude = Node(Function(input_names=['copes_exclude'],
+                                     output_names=['copes_exclude_file'],
+                                     function=copes_to_exclude),
+                            name='copes_to_exclude')
 
     cope_sorter = pe.Node(niu.Function(input_names=['copes', 'varcopes',
-                                                    'contrasts'],
+                                                    'contrasts', 'subject_id', 'model_id',
+                                                    'exclude_dir'],
                                        output_names=['copes', 'varcopes',
-                                                     'n_runs'],
+                                                     'n_runs', 'copes_exclude',
+                                                     'idx_lists', 'num_copes'],
                                        function=sort_copes),
                           name='cope_sorter')
+    cope_sorter.inputs.exclude_dir = exclude_dir
+
+    ## inserted fixed effects workflow in order to make changes (Anne)
+
+    fixed_fx = pe.Workflow(name='fixedfx')
+
+    inputspec = pe.Node(niu.IdentityInterface(fields=['copes',
+                                                       'varcopes',
+                                                       'dof_files'
+                                                       ]),
+                        name='inputspec')
+
+    """
+    Use :class:`nipype.interfaces.fsl.Merge` to merge the copes and
+    varcopes for each condition
+    """
+
+    copemerge = pe.MapNode(interface=fsl.Merge(dimension='t'),
+                           iterfield=['in_files'],
+                           name="copemerge")
+
+    varcopemerge = pe.MapNode(interface=fsl.Merge(dimension='t'),
+                           iterfield=['in_files'],
+                           name="varcopemerge")
+
+    """
+    Use :class:`nipype.interfaces.fsl.L2Model` to generate subject and condition
+    specific level 2 model design files
+    """
+
+    level2model = pe.MapNode(interface=fsl.L2Model(),  # changed to MapNode so different level 2
+                             iterfield=['num_copes'],  # model is made for each contrast
+                          name='l2model')
+
+    """
+    Use :class:`nipype.interfaces.fsl.FLAMEO` to estimate a second level model
+    """
+
+    flameo = pe.MapNode(interface=fsl.FLAMEO(run_mode='fe'), name="flameo",
+                        iterfield=['cope_file', 'var_cope_file', 'design_file',
+                                   't_con_file', 'cov_split_file', 'dof_var_cope_file'])
+
+    def get_dofvolumes(dof_files, cope_files, idx_lists):  # added idx_lists
+        import os
+        import nibabel as nb
+        import numpy as np
+        #img = nb.load(cope_files[0])
+        img = nb.load(cope_files)
+        if len(img.get_shape()) > 3:
+            out_data = np.zeros(img.get_shape())
+        else:
+            out_data = np.zeros(list(img.get_shape()) + [1])
+        #for i in range(out_data.shape[-1]): 
+        for i, idx in enumerate(idx_lists):
+            dof = np.loadtxt(dof_files[idx])  # idx matches copes that are being included
+            out_data[:, :, :, i] = dof
+        filename = os.path.join(os.getcwd(), 'dof_file.nii.gz')
+        newimg = nb.Nifti1Image(out_data, None, img.get_header())
+        newimg.to_filename(filename)
+        return filename
+
+    gendof = pe.MapNode(niu.Function(input_names=['dof_files', 'cope_files', 'idx_lists'],  # changed to MapNode
+                                   output_names=['dof_volume'],
+                                   function=get_dofvolumes),
+                     iterfield=['cope_files', 'idx_lists'],
+                     name='gendofvolume')
+
+    fixed_fx.connect(cope_sorter, 'idx_lists', gendof, 'idx_lists')
+
+    outputspec = pe.Node(niu.IdentityInterface(fields=['res4d',
+                                                        'copes', 'varcopes',
+                                                        'zstats', 'tstats']),
+                         name='outputspec')
+
+    fixed_fx.connect([(inputspec, copemerge, [('copes', 'in_files')]),
+                      (inputspec, varcopemerge, [('varcopes', 'in_files')]),
+                      (inputspec, gendof, [('dof_files', 'dof_files')]),
+                      (copemerge, gendof, [('merged_file', 'cope_files')]),
+                      (copemerge, flameo, [('merged_file', 'cope_file')]),
+                      (varcopemerge, flameo, [('merged_file',
+                                               'var_cope_file')]),
+                      (level2model, flameo, [('design_mat', 'design_file'),
+                                            ('design_con', 't_con_file'),
+                                            ('design_grp', 'cov_split_file')]),
+                      (gendof, flameo, [('dof_volume', 'dof_var_cope_file')]),
+                      (flameo, outputspec, [('res4d', 'res4d'),
+                                            ('copes', 'copes'),
+                                            ('var_copes', 'varcopes'),
+                                            ('zstats', 'zstats'),
+                                            ('tstats', 'tstats')
+                                            ])
+                      ])
+
+    #####
 
     pickfirst = lambda x: x[0]
 
     wf.connect(contrastgen, 'contrasts', cope_sorter, 'contrasts')
+    wf.connect(infosource, 'subject_id', cope_sorter, 'subject_id') 
+    wf.connect(infosource, 'model_id', cope_sorter, 'model_id')
+    wf.connect(cope_sorter, 'copes_exclude', copes_to_exclude, 'copes_exclude')
     wf.connect([(preproc, fixed_fx, [(('outputspec.mask', pickfirst),
                                       'flameo.mask_file')]),
                 (modelfit, cope_sorter, [('outputspec.copes', 'copes')]),
@@ -951,7 +1176,8 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
         subs.append(('bold_dtype_mcf_mask_smooth_mask_gms_tempfilt_mean_flirt',
         'affine'))
 
-        for i in range(len(conds)):
+        #for i in range(len(conds)):
+        for i in range(conds):    # Anne
             subs.append(('_flameo%d/cope1.' % i, 'cope%02d.' % (i + 1)))
             subs.append(('_flameo%d/varcope1.' % i, 'varcope%02d.' % (i + 1)))
             subs.append(('_flameo%d/zstat1.' % i, 'zstat%02d.' % (i + 1)))
@@ -959,15 +1185,15 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
             subs.append(('_flameo%d/res4d.' % i, 'res4d%02d.' % (i + 1)))
             subs.append(('_warpall%d/cope1_warp.' % i,
                          'cope%02d.' % (i + 1)))
-            subs.append(('_warpall%d/varcope1_warp.' % (len(conds) + i),
+            subs.append(('_warpall%d/varcope1_warp.' % (conds + i),
                          'varcope%02d.' % (i + 1)))
-            subs.append(('_warpall%d/zstat1_warp.' % (2 * len(conds) + i),
+            subs.append(('_warpall%d/zstat1_warp.' % (2 * conds + i),
                          'zstat%02d.' % (i + 1)))
             subs.append(('_warpall%d/cope1_trans.' % i,
                          'cope%02d.' % (i + 1)))
-            subs.append(('_warpall%d/varcope1_trans.' % (len(conds) + i),
+            subs.append(('_warpall%d/varcope1_trans.' % (conds + i),
                          'varcope%02d.' % (i + 1)))
-            subs.append(('_warpall%d/zstat1_trans.' % (2 * len(conds) + i),
+            subs.append(('_warpall%d/zstat1_trans.' % (2 * conds + i),
                          'zstat%02d.' % (i + 1)))
             subs.append(('__get_aparc_means%d/' % i, '/cope%02d_' % (i + 1)))
 
@@ -998,7 +1224,8 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
     wf.connect(infosource, 'subject_id', subsgen, 'subject_id')
     wf.connect(infosource, 'model_id', subsgen, 'model_id')
     wf.connect(infosource, 'task_id', subsgen, 'task_id')
-    wf.connect(contrastgen, 'contrasts', subsgen, 'conds')
+    #wf.connect(contrastgen, 'contrasts', subsgen, 'conds')
+    wf.connect(cope_sorter, 'num_copes', subsgen, 'conds')
     wf.connect(subsgen, 'substitutions', datasink, 'substitutions')
     wf.connect([(fixed_fx.get_node('outputspec'), datasink,
                                  [('res4d', 'res4d'),
@@ -1017,6 +1244,7 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
                                      ('outputspec.motion_plots',
                                       'qa.motion.plots'),
                                      ('outputspec.mask', 'qa.mask')])])
+    wf.connect(copes_to_exclude, 'copes_exclude_file', datasink, 'qa.copes_to_exclude')
     wf.connect(registration, 'outputspec.mean2anat_mask', datasink, 'qa.mask.mean2anat')
     wf.connect(art, 'norm_files', datasink, 'qa.art.@norm')
     wf.connect(art, 'intensity_files', datasink, 'qa.art.@intensity')
@@ -1078,6 +1306,8 @@ if __name__ == '__main__':
                         type=float, help="Spatial FWHM" + defstr)
     parser.add_argument('--derivatives', action="store_true",
                         help="Use derivatives" + defstr)
+    parser.add_argument('--exclude_dir', dest="exclude_dir",
+                        help="Directory w/ text files of copes to exclude" + defstr)
     parser.add_argument("-o", "--output_dir", dest="outdir",
                         help="Output directory base")
     parser.add_argument("-w", "--work_dir", dest="work_dir",
@@ -1104,6 +1334,9 @@ if __name__ == '__main__':
         outdir = os.path.join(work_dir, 'output')
     outdir = os.path.join(outdir, 'model%02d' % int(args.model),
                           'task%03d' % int(args.task))
+    exclude_dir = None
+    if args.exclude_dir:
+        exclude_dir = os.path.abspath(args.exclude_dir)
     derivatives = args.derivatives
     if derivatives is None:
        derivatives = False
@@ -1113,6 +1346,7 @@ if __name__ == '__main__':
                                   task_id=[int(args.task)],
                                   subj_prefix=args.subjectprefix,
                                   output_dir=outdir,
+                                  exclude_dir=exclude_dir,
                                   hpcutoff=args.hpfilter,
                                   use_derivatives=derivatives,
                                   fwhm=args.fwhm,
@@ -1124,4 +1358,5 @@ if __name__ == '__main__':
     if args.plugin_args:
         wf.run(args.plugin, plugin_args=eval(args.plugin_args))
     else:
-        wf.run(args.plugin)
+        #wf.run(args.plugin)
+        wf.run(args.plugin, plugin_args={'sbatch_args': '-p om_all_nodes'})
